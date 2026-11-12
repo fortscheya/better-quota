@@ -1,0 +1,35 @@
+# Plugin-owned config_yaml (not a replacement for CPA's config).
+strategy: capacity_weighted # 按额度；capacity_reset = 按额度和重置时间
+state_path: /CLIProxyAPI/plugins/data/better-quota/state.json
+# Required fallback route when the credential does not declare proxy_url.
+# Use "direct" deliberately, or an HTTP(S)/SOCKS5 proxy URL reachable from CPA.
+fallback_proxy_url: direct
+max_stale_seconds: 120
+fetch_workers: 8
+floor_5h: 10
+floor_7d: 5
+max_active: 3 # config-only default shared across every model on each Codex credential
+# Auth ID -> per-credential concurrency limit. The dashboard can edit these in batches.
+active_overrides: {}
+# Auth ID -> window seconds -> calibrated capacity; unknown plans default to 1.
+# capacity_overrides:
+#   some-auth-id: {18000: 1, 604800: 2}
+capacity_overrides: {}
+queue_limit: 128
+wait_seconds: 2
+reservation_seconds: 10
+sticky_seconds: 3600
+exclude_auth_ids: []
+# Optional plugin-owned route priority overrides. Higher values are selected first.
+route_priority_overrides: {}
+auto_reset:
+  enabled: true
+  lead_seconds: 1800
+  patrol_seconds: 300
+  # Empty means every eligible Codex auth; a non-empty list limits autoreset to these auth IDs.
+  auth_ids: []
+auto_ping:
+  enabled: false
+  mode: daily_5h # daily_5h -> 00:00/05:00/10:00/15:00/20:00 UTC+8 each day
+  times: [] # fixed_times -> e.g. ["12:00", "17:00"]
+  model: gpt-6-luna # set an available Codex model before enabling

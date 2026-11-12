@@ -1,0 +1,380 @@
+package pluginhost
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// Runs in a copied public CPA source tree, with an empty synthetic auth dir.
+// No live CPA process, real credential, or account endpoint is involved.
+func TestBetterQuotaNativeContract(t *testing.T) {
+	path := os.Getenv("BQ_PLUGIN_PATH")
+	if path == "" {
+		t.Fatal("BQ_PLUGIN_PATH required")
+	}
+	version := os.Getenv("BQ_VERSION")
+	ctx := context.Background()
+	h := New()
+	authDir := t.TempDir()
+	h.runtimeConfig = &config.Config{AuthDir: authDir}
+	h.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	proxy, posts := betterQuotaSyntheticProxy(t)
+	var indexes []string
+	for _, id := range []string{"synthetic-a.json", "synthetic-b.json"} {
+		path := filepath.Join(authDir, id)
+		raw, _ := json.Marshal(map[string]any{"type": "codex", "access_token": "synthetic-only", "account_id": id, "proxy_url": proxy})
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		a := &coreauth.Auth{ID: id, Provider: "codex", FileName: id, Status: coreauth.StatusActive, Attributes: map[string]string{"path": path, "source": path}}
+		a.EnsureIndex()
+		if _, err := h.currentAuthManager().Register(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+		indexes = append(indexes, a.Index)
+	}
+	client, e := dynamicLibraryLoader{}.Open(pluginFile{ID: "better-quota", Path: path, Version: version}, h)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer client.Shutdown()
+	cfg := []byte("enabled: true\npriority: 10\nstore: {version: " + version + "}\nstate_path: " + filepath.Join(t.TempDir(), "state.json") + "\nmax_active: 1\nwait_seconds: 0\nqueue_limit: 0\nauto_reset:\n  enabled: true\n")
+	p, e := registerRPCPlugin(ctx, h, "better-quota", client, pluginabi.MethodPluginRegister, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !validPlugin(p) {
+		t.Fatal("production host rejected plugin metadata or capabilities")
+	}
+	caps := p.Capabilities
+	if caps.Scheduler == nil || caps.RequestInterceptor == nil || caps.RequestLifecyclePlugin == nil || caps.StreamChunkInterceptor == nil || caps.WebSocketResponseObserver == nil || caps.ManagementAPI == nil || caps.QuotaProvider == nil {
+		t.Fatal("missing capability adapter")
+	}
+	before, e := caps.RequestInterceptor.InterceptRequestBeforeAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-id", Headers: http.Header{"X-Better-Quota-Execution": {"client-forged"}}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if before.Headers.Get("X-Better-Quota-Execution") != "native-id" {
+		t.Fatal("header replacement contract")
+	}
+	_, e = caps.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{Provider: "codex", Model: "synthetic-model", Options: pluginapi.SchedulerOptions{Headers: before.Headers}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "not-real", Provider: "codex"}}})
+	if e == nil {
+		t.Fatal("missing quota should reject")
+	}
+	statusError, ok := e.(interface{ StatusCode() int })
+	if !ok || statusError.StatusCode() != 503 {
+		t.Fatal("scheduler error lost downstream status", e)
+	}
+	after, e := caps.RequestInterceptor.InterceptRequestAfterAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-id", ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": "not-real"}})
+	if e != nil || !after.Terminate || after.StatusCode != 429 || len(after.ClearHeaders) != 1 {
+		t.Fatal(after, e)
+	}
+	stream, e := caps.StreamChunkInterceptor.InterceptStreamChunk(ctx, pluginapi.StreamChunkInterceptRequest{RequestID: "native-id", Body: []byte("data: preserved"), ChunkIndex: 0})
+	if e != nil || stream.DropChunk || len(stream.Body) != 0 {
+		t.Fatal("stream changed", stream, e)
+	}
+	nonCodexBefore, e := caps.RequestInterceptor.InterceptRequestBeforeAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-non-codex"})
+	if e != nil || nonCodexBefore.Terminate {
+		t.Fatal("non-Codex before hook failed", nonCodexBefore, e)
+	}
+	nonCodexPick, e := caps.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{Provider: "zcode", Model: "glm-5.3", Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "zcode-auth", Provider: "zcode"}}})
+	if e != nil || nonCodexPick.Handled || nonCodexPick.Reject {
+		t.Fatal("non-Codex scheduler was intercepted", nonCodexPick, e)
+	}
+	nonCodexAfter, e := caps.RequestInterceptor.InterceptRequestAfterAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-non-codex", ToFormat: "zcode", Metadata: map[string]any{"selected_auth_id": "zcode-auth"}})
+	if e != nil || nonCodexAfter.Terminate || len(nonCodexAfter.ClearHeaders) != 1 {
+		t.Fatal("non-Codex after hook changed request", nonCodexAfter, e)
+	}
+	if e = caps.RequestLifecyclePlugin.HandleRequestComplete(ctx, pluginapi.RequestCompletion{RequestID: "native-non-codex", Outcome: pluginapi.RequestCompletionSucceeded, CompletedAt: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	// A 13 MiB body exceeds the old 16 MiB ABI cap after JSON/base64.
+	// Header-init duplicates the prompt even though schema v6 omits it on payload chunks.
+	largeBody := bytes.Repeat([]byte("x"), 13<<20)
+	largeBefore, e := caps.RequestInterceptor.InterceptRequestBeforeAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-large", Body: largeBody})
+	if e != nil || largeBefore.Terminate || len(largeBefore.Body) != 0 || largeBefore.Headers.Get("X-Better-Quota-Execution") != "native-large" {
+		t.Fatal("large before hook did not preserve scheduler context/body", e)
+	}
+	largeAfter, e := caps.RequestInterceptor.InterceptRequestAfterAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-large", ToFormat: "zcode", Body: largeBody, Metadata: map[string]any{"selected_auth_id": "zcode-auth"}})
+	if e != nil || largeAfter.Terminate || len(largeAfter.Body) != 0 || len(largeAfter.Headers) != 0 || largeAfter.Path != "" {
+		t.Fatal("large non-Codex request was modified", e)
+	}
+	chain := newHostWithRecords(capabilityRecord{id: "better-quota", version: version, plugin: p})
+	requestHeaders := http.Header{"X-Passthrough": {"opaque"}, "X-Better-Quota-Execution": {"native-large"}}
+	passed := chain.InterceptRequestAfterAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-large", ToFormat: "zcode", Body: largeBody, Headers: requestHeaders, Metadata: map[string]any{"selected_auth_id": "zcode-auth"}})
+	if passed.Terminate || len(passed.Body) != 0 || len(passed.Headers) != 1 || passed.Headers.Get("X-Passthrough") != "opaque" || passed.Path != "" {
+		t.Fatal("host did not preserve non-Codex request body/headers")
+	}
+	for _, req := range []pluginapi.StreamChunkInterceptRequest{
+		{RequestID: "native-large", ChunkIndex: pluginapi.StreamChunkHeaderInitIndex, OriginalRequest: largeBody[:7<<20], RequestBody: largeBody[:7<<20]},
+		{RequestID: "native-large", ChunkIndex: 0, Body: largeBody},
+	} {
+		req.ResponseHeaders = http.Header{"X-Passthrough": {"opaque"}}
+		stream, err := caps.StreamChunkInterceptor.InterceptStreamChunk(ctx, req)
+		if err != nil || stream.DropChunk || len(stream.Body) != 0 || len(stream.Headers) != 0 || len(stream.ClearHeaders) != 0 {
+			t.Fatal("large stream must return no modifications", req.ChunkIndex, err)
+		}
+		passed := chain.InterceptStreamChunk(ctx, req)
+		if passed.DropChunk || !bytes.Equal(passed.Body, req.Body) || len(passed.Headers) != 1 || passed.Headers.Get("X-Passthrough") != "opaque" {
+			t.Fatal("host did not preserve stream bytes/headers", req.ChunkIndex)
+		}
+	}
+	if e = caps.RequestLifecyclePlugin.HandleRequestComplete(ctx, pluginapi.RequestCompletion{RequestID: "native-large", Outcome: pluginapi.RequestCompletionSucceeded, CompletedAt: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	if e = caps.WebSocketResponseObserver.ObserveWebSocketResponseEvent(ctx, pluginapi.WebSocketResponseEvent{RequestID: "native-id", EventType: "response.completed"}); e != nil {
+		t.Fatal(e)
+	}
+	if e = caps.RequestLifecyclePlugin.HandleRequestComplete(ctx, pluginapi.RequestCompletion{RequestID: "native-id", Outcome: pluginapi.RequestCompletionCanceled, CompletedAt: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	registration, e := caps.ManagementAPI.RegisterManagement(ctx, pluginapi.ManagementRegistrationRequest{BasePath: "/v0/management", ResourceBasePath: "/v0/resource/plugins/better-quota"})
+	if e != nil || len(registration.Routes) != 5 || len(registration.Resources) != 1 {
+		t.Fatal(registration, e)
+	}
+	handler := registration.Routes[0].Handler
+	if handler == nil {
+		t.Fatal("missing management handler")
+	}
+	response, e := handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/better-quota/status"})
+	if e != nil || response.StatusCode != 200 {
+		t.Fatal(response, e)
+	}
+	var status struct {
+		Version string `json:"version"`
+		Gate    struct {
+			Admitted int `json:"admitted"`
+			Reserved int `json:"reserved"`
+		} `json:"gate"`
+	}
+	if json.Unmarshal(response.Body, &status) != nil || status.Version != version || status.Gate.Admitted != 0 || status.Gate.Reserved != 0 {
+		t.Fatalf("status %s", response.Body)
+	}
+	response, e = handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "GET", Path: "/v0/resource/plugins/better-quota/status"})
+	if e != nil || response.StatusCode != 404 {
+		t.Fatal("resource data boundary", response, e)
+	}
+
+	// Exercise the installed artifact through the real loader and host auth callbacks.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		qr, err := caps.QuotaProvider.FetchQuota(ctx, pluginapi.QuotaFetchRequest{AuthIndex: indexes[0], Provider: "codex"})
+		qr2, err2 := caps.QuotaProvider.FetchQuota(ctx, pluginapi.QuotaFetchRequest{AuthIndex: indexes[1], Provider: "codex"})
+		if err == nil && err2 == nil && len(qr.Groups) == 1 && len(qr2.Groups) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			status, _ := handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/better-quota/status"})
+			t.Fatalf("synthetic OAuth quotas not discovered: %v %v status=%s", err, err2, status.Body)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The native loader exposes only the read-only 0..10000 quantized score and
+	// the durable priority controls; the removed /priorities route is not used.
+	response, e = handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/better-quota/status"})
+	var dashboard struct {
+		Accounts []struct {
+			Quantized     int  `json:"quantized_score"`
+			OneShot      bool `json:"one_shot_selected"`
+			Continuous   bool `json:"continuous_selected"`
+		} `json:"dashboard_accounts"`
+	}
+	if e != nil || json.Unmarshal(response.Body, &dashboard) != nil || len(dashboard.Accounts) != 2 {
+		t.Fatal("missing quantized dashboard through native adapter", e)
+	}
+	for _, account := range dashboard.Accounts {
+		if account.Quantized != 10000 {
+			t.Fatal("quantized native score mismatch")
+		}
+	}
+	control := func(mode string, enabled bool) {
+		body, _ := json.Marshal(map[string]any{"mode": mode, "auth_id": "synthetic-a.json", "enabled": enabled})
+		reply, err := handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "POST", Path: "/v0/management/plugins/better-quota/priority-controls", Body: body})
+		if err != nil || reply.StatusCode != 200 {
+			t.Fatalf("native priority control rejected: status=%d err=%v body=%s", reply.StatusCode, err, reply.Body)
+		}
+	}
+	control("continuous", true)
+	before, e = caps.RequestInterceptor.InterceptRequestBeforeAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: "native-priority"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	pick, e := caps.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{Provider: "codex", Model: "synthetic-model", Options: pluginapi.SchedulerOptions{Headers: before.Headers}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "synthetic-a.json", Provider: "codex"}, {ID: "synthetic-b.json", Provider: "codex"}}})
+	if e != nil || pick.AuthID != "synthetic-a.json" {
+		t.Fatal("native scheduler ignored continuous priority", e)
+	}
+	if e = caps.RequestLifecyclePlugin.HandleRequestComplete(ctx, pluginapi.RequestCompletion{RequestID: "native-priority", Outcome: pluginapi.RequestCompletionCanceled, CompletedAt: time.Now()}); e != nil {
+		t.Fatal(e)
+	}
+	control("continuous", false)
+	var chosen []string
+	for _, id := range []string{"lease-a", "lease-b", "lease-c"} {
+		before, err := caps.RequestInterceptor.InterceptRequestBeforeAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pick, err := caps.Scheduler.Pick(ctx, pluginapi.SchedulerPickRequest{Provider: "codex", Model: "synthetic-model", Options: pluginapi.SchedulerOptions{Headers: before.Headers}, Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "synthetic-a.json", Provider: "codex"}, {ID: "synthetic-b.json", Provider: "codex"}}})
+		if id == "lease-c" {
+			if err == nil {
+				t.Fatal("pool saturation accepted")
+			}
+			status, ok := err.(interface{ StatusCode() int })
+			retry, okRetry := err.(interface{ RetryAfter() *time.Duration })
+			if !ok || status.StatusCode() != 429 || !okRetry || retry.RetryAfter() == nil || *retry.RetryAfter() != time.Second {
+				t.Fatalf("v8.0.57 retry metadata lost: %v", err)
+			}
+		} else {
+			if err != nil || !pick.Handled || pick.AuthID == "" {
+				t.Fatalf("synthetic pick: %+v %v", pick, err)
+			}
+			chosen = append(chosen, pick.AuthID)
+			admitted, err := caps.RequestInterceptor.InterceptRequestAfterAuth(ctx, pluginapi.RequestInterceptRequest{RequestID: id, ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": pick.AuthID}})
+			if err != nil || admitted.Terminate {
+				t.Fatalf("synthetic admit: %+v %v", admitted, err)
+			}
+		}
+	}
+	if len(chosen) != 2 || chosen[0] == chosen[1] {
+		t.Fatal("busy auth was reused", chosen)
+	}
+	// Use the host's asynchronous completion dispatch, including a canceled context.
+	setHostSnapshotForTest(h, true, normalizeTestCapabilityRecord(capabilityRecord{id: "better-quota", plugin: p}))
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, id := range []string{"lease-a", "lease-b", "lease-c"} {
+		h.CompleteRequest(canceled, pluginapi.RequestCompletion{RequestID: id, Outcome: pluginapi.RequestCompletionCanceled, CompletedAt: time.Now()})
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		response, err := handler.HandleManagement(ctx, pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/better-quota/status"})
+		var state struct {
+			Gate          struct{ Admitted, Reserved int }
+			ResetAccounts map[string]struct {
+				Available *int `json:"available_count"`
+				Error     string
+			}
+		}
+		if err != nil || json.Unmarshal(response.Body, &state) != nil {
+			t.Fatal("status decode", err)
+		}
+		// Decode the snake_case reset key separately.
+		var reset struct {
+			Accounts map[string]struct {
+				Available *int `json:"available_count"`
+				Error     string
+			} `json:"reset_accounts"`
+		}
+		_ = json.Unmarshal(response.Body, &reset)
+		patrols := len(reset.Accounts) == 2
+		for _, s := range reset.Accounts {
+			patrols = patrols && s.Available != nil && *s.Available == 1 && s.Error == ""
+		}
+		if state.Gate.Admitted == 0 && state.Gate.Reserved == 0 && patrols {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("completion/credit patrol not settled: %s", response.Body)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if posts.Load() != 0 {
+		t.Fatal("non-expiring credit consumed")
+	}
+	if _, e = client.Call(ctx, pluginabi.MethodPluginQuiesce, []byte(`{}`)); e != nil {
+		t.Fatal(e)
+	}
+}
+
+// A synthetic CONNECT proxy terminates TLS locally; it cannot reach the Internet.
+func betterQuotaSyntheticProxy(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "chatgpt.com"}, DNSNames: []string{"chatgpt.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := filepath.Join(t.TempDir(), "synthetic-ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// A c-shared Go runtime snapshots the process environment separately.
+	// Add this synthetic CA to the disposable container's default trust directory.
+	systemCA := "/etc/ssl/certs/better-quota-synthetic-test.pem"
+	if err := os.WriteFile(systemCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(systemCA) })
+	t.Setenv("SSL_CERT_FILE", ca)
+	t.Setenv("SSL_CERT_DIR", t.TempDir())
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "CONNECT" || r.Host != "chatgpt.com:443" {
+			http.Error(w, "synthetic CONNECT only", 403)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		secured := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS12})
+		defer secured.Close()
+		if err := secured.Handshake(); err != nil {
+			t.Errorf("synthetic TLS handshake: %v", err)
+			return
+		}
+		req, err := http.ReadRequest(bufio.NewReader(secured))
+		if err != nil {
+			return
+		}
+		defer req.Body.Close()
+		if req.Header.Get("Authorization") != "Bearer synthetic-only" {
+			t.Error("synthetic authorization missing")
+			return
+		}
+		body := ""
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			body = fmt.Sprintf(`{"plan_type":"test","rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"used_percent":20,"reset_at":%d},"secondary_window":{"limit_window_seconds":604800,"used_percent":30,"reset_at":%d}}}`, time.Now().Add(time.Hour).Unix(), time.Now().Add(7*24*time.Hour).Unix())
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body = fmt.Sprintf(`{"available_count":1,"credits":[{"id":"synthetic-credit","status":"available","expires_at":%q}]}`, time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339))
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			posts.Add(1)
+			body = `{"code":"nothing_to_reset"}`
+		default:
+			t.Errorf("unexpected synthetic path %q", req.URL.Path)
+			return
+		}
+		fmt.Fprintf(secured, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL, &posts
+}
